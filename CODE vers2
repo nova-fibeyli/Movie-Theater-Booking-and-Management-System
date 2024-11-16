@@ -1,0 +1,214 @@
+{-# LANGUAGE DeriveGeneric #-}
+
+module Main where
+
+import qualified Data.Text.IO as TIO
+import Data.UUID (UUID)
+import qualified Data.UUID.V4 as UUID
+import Data.Text (Text)
+import Text.Read (readMaybe)
+import Data.Map (Map)
+import qualified Data.Map as Map
+import Data.Either (partitionEithers)
+import Control.Monad (when, unless)
+import GHC.Generics (Generic)
+
+-- ** Data Structures ** --
+
+data Movie = Movie
+  { movieId     :: UUID
+  , title       :: Text
+  , showtime    :: Text
+  , ticketPrice :: Rational
+  } deriving (Show, Generic, Eq)
+
+data Seat = Seat
+  { seatId      :: UUID
+  , row         :: Int
+  , number      :: Int
+  , isAvailable :: Bool
+  } deriving (Show, Generic, Eq)
+
+data Booking = Booking
+  { bookingId      :: UUID
+  , movie          :: Movie
+  , bookedSeats    :: [Seat]
+  , totalCost      :: Rational
+  , customerEmail  :: Text
+  } deriving (Show, Generic, Eq)
+
+type Theater = Map UUID (Movie, [Seat]) -- Maps Movie ID to (Movie, List of Seats)
+type PromoCodes = Map Text Double       -- Maps Promo Code to Discount Percentage
+
+-- ** Helper Function: Maybe to Either ** --
+maybeToEither :: e -> Maybe a -> Either e a
+maybeToEither e Nothing  = Left e
+maybeToEither _ (Just x) = Right x
+
+-- ** Core Functions ** --
+
+-- Check Seat Availability
+checkSeatAvailability :: Theater -> UUID -> Int -> Int -> Either String Seat
+checkSeatAvailability theater mid targetRow targetNumber = do
+  (movie, seats) <- maybeToEither "Movie not found" $ Map.lookup mid theater
+  let matchingSeats = filter (\s -> row s == targetRow && number s == targetNumber) seats
+  case matchingSeats of
+    [seat] | isAvailable seat -> Right seat
+    [seat] -> Left "Seat not available"
+    _      -> Left "Seat not found"
+
+-- Book Seats for a Movie
+bookSeats :: Theater -> UUID -> [(Int, Int)] -> String -> Either String (Theater, Booking)
+bookSeats theater mid seatRefs customerEmail = do
+  (movie, seats) <- maybeToEither "Movie not found" $ Map.lookup mid theater
+  validSeats <- traverse (\(r, n) -> checkSeatAvailability theater mid r n) seatRefs
+
+  let updatedSeats = map (\s -> s { isAvailable = False }) validSeats
+      totalCost = fromIntegral (length validSeats) * ticketPrice movie
+      booking = Booking nextBookingId movie updatedSeats totalCost customerEmail
+      updatedTheater = Map.adjust (\(m, ss) -> (m, updateSeats ss validSeats)) mid theater
+
+  return (updatedTheater, booking)
+
+updateSeats :: [Seat] -> [Seat] -> [Seat]
+updateSeats allSeats bookedSeats = 
+  map (\s -> if s `elem` bookedSeats then s { isAvailable = False } else s) allSeats
+
+-- Cancel Booking
+cancelBooking :: Theater -> Booking -> Either String Theater
+cancelBooking theater booking = do
+  let mid = movieId $ movie booking
+  (movie, seats) <- maybeToEither "Movie not found" $ Map.lookup mid theater
+  let updatedSeats = map (\s -> s { isAvailable = True }) (bookedSeats booking)
+      newSeatList = updatedSeats ++ filter (`notElem` bookedSeats booking) seats
+  Right $ Map.insert mid (movie, newSeatList) theater
+
+-- Apply Promotional Code
+applyPromoCode :: PromoCodes -> Text -> Double -> Either String Double
+applyPromoCode promoCodes code totalCost =
+  case Map.lookup code promoCodes of
+    Nothing       -> Left "Invalid promo code"
+    Just discount -> Right $ totalCost * (1 - discount / 100)
+
+-- Generate Statistics
+data Stats = Stats
+  { totalRevenue       :: Double
+  , totalSeatsSold     :: Int
+  , averageBookingCost :: Double
+  } deriving (Show, Eq)
+
+generateStats :: [Booking] -> Stats
+generateStats bookings =
+  let totalRevenue = sum $ map totalCost bookings
+      totalSeatsSold = sum $ map (length . bookedSeats) bookings
+      averageBookingCost = if null bookings then 0 else totalRevenue / fromIntegral (length bookings)
+   in Stats totalRevenue totalSeatsSold averageBookingCost
+
+-- Helper Function: Generate Booking ID
+nextBookingId :: UUID
+nextBookingId = UUID.nextRandom
+
+-- ** Sample Data ** --
+
+movie1 :: Movie
+movie1 = Movie { movieId = UUID.nextRandom, title = "Inception", showtime = "7:00 PM", ticketPrice = 10.0 }
+
+movie2 :: Movie
+movie2 = Movie { movieId = UUID.nextRandom, title = "The Matrix", showtime = "9:00 PM", ticketPrice = 12.0 }
+
+seats :: [Seat]
+seats = 
+  [ Seat { seatId = UUID.nextRandom, row = 1, number = 1, isAvailable = True }
+  , Seat { seatId = UUID.nextRandom, row = 1, number = 2, isAvailable = True }
+  , Seat { seatId = UUID.nextRandom, row = 1, number = 3, isAvailable = False }
+  , Seat { seatId = UUID.nextRandom, row = 2, number = 1, isAvailable = True }
+  ]
+
+initialTheater :: Theater
+initialTheater = Map.fromList
+  [ (movieId movie1, (movie1, seats))
+  , (movieId movie2, (movie2, seats))
+  ]
+
+promoCodes :: PromoCodes
+promoCodes = Map.fromList
+  [ ("DISCOUNT10", 10.0)
+  , ("HALFPRICE", 50.0)
+  ]
+
+-- ** Main IO ** --
+
+main :: IO ()
+main = do
+  TIO.putStrLn "Welcome to the Movie Theater Booking System!"
+  mainLoop initialTheater []
+
+mainLoop :: Theater -> [Booking] -> IO ()
+mainLoop theater bookings = do
+  TIO.putStrLn "\nMenu:"
+  TIO.putStrLn "1. View Movies"
+  TIO.putStrLn "2. Check Seat Availability"
+  TIO.putStrLn "3. Book Seats"
+  TIO.putStrLn "4. Apply Promo Code"
+  TIO.putStrLn "5. Generate Statistics"
+  TIO.putStrLn "6. Exit"
+  TIO.putStrLn "Enter your choice: "
+  choice <- TIO.getLine
+  case choice of
+    "1" -> do
+      TIO.putStrLn "Available Movies:"
+      mapM_ (TIO.putStrLn . show) (Map.elems $ fmap fst theater)
+      mainLoop theater bookings
+    "2" -> do
+      TIO.putStrLn "Enter Movie ID, Row, and Seat Number:"
+      mid <- readMaybeInput "Movie ID"
+      row <- readMaybeInput "Row"
+      number <- readMaybeInput "Seat Number"
+      case (mid, row, number) of
+        (Just mid', Just row', Just number') ->
+          case checkSeatAvailability theater mid' row' number' of
+            Right seat -> TIO.putStrLn $ "Seat is available: " <> show seat
+            Left err   -> TIO.putStrLn $ "Error: " <> err
+        _ -> TIO.putStrLn "Invalid input, please enter valid numbers."
+      mainLoop theater bookings
+    "3" -> do
+      TIO.putStrLn "Enter Movie ID and Customer Email:"
+      mid <- readMaybeInput "Movie ID"
+      email <- TIO.getLine
+      TIO.putStrLn "Enter number of seats to book:"
+      n <- readMaybeInput "Number of seats"
+      case (mid, n) of
+        (Just mid', Just n') -> do
+          TIO.putStrLn "Enter row and seat numbers (one pair per line):"
+          seatRefs <- mapM (\_ -> do r <- readMaybeInput "Row"; n <- readMaybeInput "Seat Number"; return (r, n)) [1..n']
+          case bookSeats theater mid' (catMaybes seatRefs) email of
+            Right (updatedTheater, booking) -> do
+              TIO.putStrLn $ "Booking successful: " <> show booking
+              mainLoop updatedTheater (booking : bookings)
+            Left err -> do
+              TIO.putStrLn $ "Error: " <> err
+              mainLoop theater bookings
+        _ -> TIO.putStrLn "Invalid input, please enter valid numbers."
+    "4" -> do
+      TIO.putStrLn "Enter Promo Code and Total Cost:"
+      code <- TIO.getLine
+      cost <- readMaybeInput "Total Cost"
+      case cost of
+        Just cost' -> 
+          case applyPromoCode promoCodes code cost' of
+            Right discountedCost -> TIO.putStrLn $ "Discounted cost: " <> show discountedCost
+            Left err             -> TIO.putStrLn $ "Error: " <> err
+        Nothing -> TIO.putStrLn "Invalid input, please enter a valid number."
+      mainLoop theater bookings
+    "5" -> do
+      let stats = generateStats bookings
+      TIO.putStrLn $ "Statistics: " <> show stats
+      mainLoop theater bookings
+    "6" -> TIO.putStrLn "Goodbye!"
+    _ -> TIO.putStrLn "Invalid choice, please try again." >> mainLoop theater bookings
+
+readMaybeInput :: Read a => Text -> IO (Maybe a)
+readMaybeInput prompt = do
+  TIO.putStrLn $ prompt <> ":"
+  input <- TIO.getLine
+  return $ readMaybe $ T.unpack input
